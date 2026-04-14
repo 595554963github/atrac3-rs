@@ -552,7 +552,7 @@ struct BudgetSolution {
     mse: f32,
 }
 
-fn optimal_sf_index_for_peak(peak: f32, selector: u8) -> u8 {
+pub fn optimal_sf_index_for_peak(peak: f32, selector: u8) -> u8 {
     if peak <= 0.0 {
         return 0;
     }
@@ -572,7 +572,11 @@ fn optimal_sf_index_for_peak(peak: f32, selector: u8) -> u8 {
     };
     let needed_sf = peak / (max_mantissa * imq);
     let log_sf = needed_sf.max(1e-10).log2();
-    let index = (log_sf * 3.0 + 15.0).round() as i32;
+    // Ceil instead of round: guarantees the returned sfIndex accommodates
+    // the peak without clipping. Round would land below the required value
+    // about half the time and cause silent saturation at the codebook
+    // boundary, showing up as worst-case errors much larger than the step.
+    let index = (log_sf * 3.0 + 15.0).ceil() as i32;
     index.clamp(0, 63) as u8
 }
 
@@ -958,14 +962,21 @@ fn build_spectral_unit_budgeted(
         let peak = slice.iter().map(|c| c.abs()).fold(0.0f32, f32::max);
         let sf_center = optimal_sf_index_for_peak(peak, selector);
 
+        // sfIndex refinement: given the peak-fitting sfIndex (computed with
+        // ceil, so it always accommodates the peak), search up to three
+        // steps above it and pick the one that minimizes the worst-case
+        // absolute reconstruction error. Going below sf_center would clip
+        // the peak; going above trades precision for coarser grid which the
+        // criterion will prefer only when the finer grid actually produces
+        // a worse worst-case bin.
         let mut best: Option<QuantizedSubband> = None;
         let mut best_score = f32::INFINITY;
-        for delta in -2i8..=2 {
+        for delta in 0i8..=3 {
             let sf_try = (sf_center as i8 + delta).clamp(0, 63) as u8;
             if let Ok(candidate) = quantize_subband(slice, selector, sf_try, coding_mode) {
                 let bits = candidate_total_bits(&candidate);
                 if used_bits + bits <= target_bits {
-                    let score = candidate.mse;
+                    let score = candidate.max_abs_err;
                     if best.is_none() || score < best_score - 1e-12 {
                         best_score = score;
                         best = Some(candidate);
@@ -1328,6 +1339,182 @@ fn build_canonical_codebook(raw: &[(u8, u8)]) -> Vec<HuffmanEntry> {
             }
         })
         .collect()
+}
+
+// ---------- Tonal extractor ----------
+
+/// Result of tonal extraction: sound-unit-ready components plus a running
+/// bit count that the spectral allocator must subtract from its budget.
+pub struct TonalExtractionResult {
+    pub tonal_mode_selector: super::sound_unit::TonalCodingModeSelector,
+    pub tonal_components: Vec<super::sound_unit::TonalComponent>,
+    pub tonal_bits: usize,
+    pub coded_qmf_bands: u8,
+}
+
+/// Scan the residual for prominent peaks and encode them as tonal
+/// components with qstep=7, CLC 6-bit, 4 values per entry. Subtracts each
+/// committed tonal value from the residual in place so that the subsequent
+/// spectral unit encodes only what is left over after removing the tones.
+/// This avoids double-coding the same energy in both the tonal stream and
+/// the spectral stream.
+pub fn extract_tonal_components(
+    residual: &mut [f32],
+    budget_bits: usize,
+    coded_qmf_bands: u8,
+    _coding_mode: CodingMode,
+    max_entries: usize,
+) -> Result<TonalExtractionResult> {
+    use super::sound_unit::*;
+
+    let qmf_bands = coded_qmf_bands as usize;
+    let total_cells = qmf_bands * 4;
+    let spectral_end = (qmf_bands * 256).min(residual.len());
+    let abs_threshold = 2.0f32;
+    let qstep: u8 = 7;
+    let clc_width = ATRAC3_CLC_LENGTH_TAB[qstep as usize];
+    let imq = ATRAC3_INV_MAX_QUANT[qstep as usize];
+    let max_mantissa = (1i32 << (clc_width - 1)) - 1;
+    let min_mantissa = -(1i32 << (clc_width - 1));
+
+    let entry_bits: usize = 12 + (clc_width as usize * 4);
+    let new_band_bits: usize = 12;
+    let base_bits: usize = 5 + 2 + qmf_bands + 3 + 3;
+    let tonal_budget = budget_bits / 4;
+
+    if tonal_budget < base_bits + entry_bits + new_band_bits {
+        return Ok(TonalExtractionResult {
+            tonal_mode_selector: TonalCodingModeSelector::AllVlc,
+            tonal_components: Vec::new(),
+            tonal_bits: 0,
+            coded_qmf_bands,
+        });
+    }
+
+    let mut cells: Vec<Vec<TonalEntry>> = vec![Vec::new(); total_cells];
+    let mut band_active = vec![false; qmf_bands];
+    let mut total_bits = base_bits;
+    let mut total_entries: usize = 0;
+
+    // First pass: collect all candidate chunks above threshold, each with
+    // its peak magnitude. Candidates are always 4-aligned.
+    let mut candidates: Vec<(usize, f32)> = Vec::new();
+    let mut pos = 0usize;
+    while pos + 3 < spectral_end {
+        let end = (pos + 4).min(spectral_end);
+        let chunk = &residual[pos..end];
+        let peak_val = chunk.iter().map(|c| c.abs()).fold(0.0f32, f32::max);
+        if peak_val >= abs_threshold {
+            candidates.push((pos, peak_val));
+        }
+        pos += 4;
+    }
+
+    // Sort by peak magnitude descending. Strongest peaks get extracted
+    // first, regardless of frequency band, so the budget is spent on the
+    // perceptually most prominent tones wherever they are in the spectrum.
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    for (pos, _peak) in candidates {
+        if total_entries >= max_entries {
+            break;
+        }
+        let end = (pos + 4).min(spectral_end);
+        let chunk = &residual[pos..end];
+        let peak_val = chunk.iter().map(|c| c.abs()).fold(0.0f32, f32::max);
+        if peak_val < abs_threshold {
+            // A previous extraction may have reduced the peak below the
+            // threshold. Skip, because what is left is not tonal any more.
+            continue;
+        }
+        let sf_idx = optimal_sf_index_for_peak(peak_val, qstep);
+        let sf_val = scale_factor(sf_idx);
+        let scale = sf_val * imq;
+        if scale < 1e-12 {
+            continue;
+        }
+
+        let mut mantissas = [0i32; 4];
+        let mut all_zero = true;
+        for (i, m) in mantissas.iter_mut().enumerate() {
+            if pos + i < spectral_end {
+                *m = (residual[pos + i] / scale).round() as i32;
+                *m = (*m).clamp(min_mantissa, max_mantissa);
+                if *m != 0 {
+                    all_zero = false;
+                }
+            }
+        }
+        if all_zero {
+            continue;
+        }
+
+        let qmf_band = pos / 256;
+        let cell_idx = pos / 64;
+        if qmf_band >= qmf_bands || cell_idx >= total_cells {
+            continue;
+        }
+        if cells[cell_idx].len() >= 7 {
+            continue;
+        }
+
+        let band_cost = if band_active[qmf_band] { 0 } else { new_band_bits };
+        if total_bits + band_cost + entry_bits > tonal_budget {
+            continue;
+        }
+
+        // Subtract the quantized tonal contribution from the residual so
+        // that the spectral allocator sees only what is left.
+        for (i, &m) in mantissas.iter().enumerate() {
+            if pos + i < spectral_end {
+                residual[pos + i] -= m as f32 * scale;
+            }
+        }
+
+        let mut payload = RawBitPayload::default();
+        for &m in &mantissas {
+            payload.push_bits((m as u32) & ((1u32 << clc_width) - 1), clc_width)?;
+        }
+        cells[cell_idx].push(TonalEntry {
+            scale_factor_index: sf_idx,
+            position: (pos % 64) as u8,
+            payload,
+        });
+
+        if !band_active[qmf_band] {
+            band_active[qmf_band] = true;
+            total_bits += new_band_bits;
+        }
+        total_bits += entry_bits;
+        total_entries += 1;
+    }
+
+    if total_entries == 0 {
+        return Ok(TonalExtractionResult {
+            tonal_mode_selector: TonalCodingModeSelector::AllVlc,
+            tonal_components: Vec::new(),
+            tonal_bits: 0,
+            coded_qmf_bands,
+        });
+    }
+
+    let tonal_cells: Vec<TonalCell> = cells
+        .into_iter()
+        .map(|entries| TonalCell { entries })
+        .collect();
+    let component = TonalComponent {
+        band_flags: band_active,
+        coded_values_minus_one: 3,
+        quant_step_index: qstep,
+        coding_mode: None,
+        cells: tonal_cells,
+    };
+    Ok(TonalExtractionResult {
+        tonal_mode_selector: TonalCodingModeSelector::AllClc,
+        tonal_components: vec![component],
+        tonal_bits: total_bits,
+        coded_qmf_bands,
+    })
 }
 
 #[cfg(test)]

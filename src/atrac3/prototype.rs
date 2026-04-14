@@ -8,8 +8,8 @@ use super::{
     mdct::{MDCT_COEFFS_PER_BAND, MDCT_INPUT_SAMPLES, Mdct256},
     qmf::{FourBandQmf, estimate_envelopes_from_interleaved},
     quant::{
-        ATRAC3_SUBBAND_TAB, SearchOptions, SpectrumEncoding, build_basic_sound_unit_from_encoding,
-        build_spectral_unit,
+        self, ATRAC3_SUBBAND_TAB, SearchOptions, SpectrumEncoding,
+        build_basic_sound_unit_from_encoding, build_spectral_unit,
     },
     sound_unit::{ChannelSoundUnit, CodingMode, GainBand, RawBitPayload, SpectralSubband},
 };
@@ -378,18 +378,66 @@ impl PrototypeEncoder {
             let min_subband_count =
                 minimum_subband_count_for_target_bits(search.target_bits.unwrap_or_default());
             let padded_skip_bits = min_subband_count.saturating_sub(1) * 3;
-            let mut adjusted_search = search;
-            if let Some(target_bits) = adjusted_search.target_bits {
-                adjusted_search.target_bits =
-                    Some(target_bits.saturating_sub(gain_payload_bits + padded_skip_bits));
-            }
+            let base_target = search.target_bits.unwrap_or(1536);
+            let spectral_budget = base_target.saturating_sub(gain_payload_bits + padded_skip_bits);
 
-            let mut spectrum =
-                build_spectral_unit(&analysis.coefficients, coding_mode, adjusted_search)?;
+            // Tonal extraction: find prominent peaks, quantize them into
+            // the tonal stream, and subtract the quantized tone from the
+            // spectrum so the spectral allocator sees only the residual.
+            // This avoids double-coding the same energy in both streams.
+            let coded_qmf_target: u8 = 3;
+            let mut residual = analysis.coefficients.clone();
+            let tonal_result = quant::extract_tonal_components(
+                &mut residual,
+                spectral_budget,
+                coded_qmf_target,
+                coding_mode,
+                4,
+            )?;
+
+            let mut adjusted_search = search;
+            adjusted_search.target_bits =
+                Some(spectral_budget.saturating_sub(tonal_result.tonal_bits));
+
+            let mut spectrum = build_spectral_unit(&residual, coding_mode, adjusted_search)?;
             pad_spectral_unit(&mut spectrum, min_subband_count);
             let mut sound_unit = build_basic_sound_unit_from_encoding(&spectrum);
-            let coded_qmf_bands = sound_unit.coded_qmf_bands as usize;
+            let coded_qmf_bands = sound_unit.coded_qmf_bands.min(coded_qmf_target) as usize;
+            sound_unit.coded_qmf_bands = coded_qmf_bands as u8;
             sound_unit.gain_bands = analysis.gain_bands[..coded_qmf_bands].to_vec();
+
+            // Attach tonal, resize band_flags/cells to match coded_qmf_bands
+            sound_unit.tonal_mode_selector = tonal_result.tonal_mode_selector;
+            sound_unit.tonal_components = tonal_result
+                .tonal_components
+                .into_iter()
+                .map(|mut c| {
+                    c.band_flags.resize(coded_qmf_bands, false);
+                    c.cells.resize(
+                        coded_qmf_bands * 4,
+                        crate::atrac3::sound_unit::TonalCell::default(),
+                    );
+                    c
+                })
+                .collect();
+
+            // Safety: if the total exceeds the per-channel slot, drop the
+            // tonal and re-quantize the original spectrum with the full
+            // budget. Spectral-only encoding is always the fallback.
+            if let Ok(total) = sound_unit.bit_len() {
+                if total > base_target {
+                    sound_unit.tonal_mode_selector =
+                        crate::atrac3::sound_unit::TonalCodingModeSelector::AllVlc;
+                    sound_unit.tonal_components.clear();
+                    adjusted_search.target_bits = Some(spectral_budget);
+                    let s2 = build_spectral_unit(
+                        &analysis.coefficients,
+                        coding_mode,
+                        adjusted_search,
+                    )?;
+                    sound_unit.spectrum = s2.spectral_unit;
+                }
+            }
 
             frame_channels.push(encode_channel(sound_unit, spectrum)?);
             frame_channels
