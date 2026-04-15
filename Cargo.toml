@@ -9,7 +9,7 @@ clap = { version = "4.5.50", features = ["derive"] }
 hound = "3.5.1"
 tempfile = "3.23.0"
 rayon = "1.10"
-
+rubato = "0.13"
 [profile.release]
 lto = "thin"
 codegen-units = 1
