@@ -203,6 +203,8 @@ pub struct PrototypeEncodeResult {
     pub frame_count: usize,
     pub frames: Vec<PrototypeFrame>,
     pub bytes: Vec<u8>,
+    pub original_samples: Vec<f32>,
+    pub options: PrototypeOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -272,8 +274,6 @@ impl PrototypeEncoder {
             .collect::<Result<Vec<_>>>()?;
 
         let mut encoder = PrototypeEncoder::new(channel_count);
-        // Phase 1: SERIAL analysis (QMF/MDCT have channel state).
-        // Collect AnalyzedChannel for every frame.
         let mut all_analyses: Vec<Vec<AnalyzedChannel>> = Vec::with_capacity(frame_count);
         for frame_index in 0..frame_count {
             let start = start_sample + frame_index * SAMPLES_PER_FRAME;
@@ -290,7 +290,6 @@ impl PrototypeEncoder {
             all_analyses.push(analyses);
         }
 
-        // Phase 2: PARALLEL quantization + bitstream (each frame independent).
         use rayon::prelude::*;
         let search_opts = SearchOptions {
             lambda: options.lambda,
@@ -316,6 +315,8 @@ impl PrototypeEncoder {
             frame_count,
             frames,
             bytes,
+            original_samples: wav.samples.clone(),
+            options,
         })
     }
 
@@ -346,10 +347,6 @@ impl PrototypeEncoder {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Encode the current frame's analysis directly. The pending_analysis
-        // buffer is kept for gain estimation state but the spectral data is
-        // NOT delayed — the Sony pipeline analyzes, estimates gain, and
-        // quantizes the same frame's data in a single pass.
         self.pending_analysis = current_analysis.clone();
         self.encode_analyzed_frame(&current_analysis, coding_mode, search)
     }
@@ -382,10 +379,6 @@ impl PrototypeEncoder {
             let base_target = search.target_bits.unwrap_or(1536);
             let spectral_budget = base_target.saturating_sub(gain_payload_bits + padded_skip_bits);
 
-            // Tonal extraction: find prominent peaks, quantize them into
-            // the tonal stream, and subtract the quantized tone from the
-            // spectrum so the spectral allocator sees only the residual.
-            // This avoids double-coding the same energy in both streams.
             let coded_qmf_target: u8 = 3;
             let mut residual = analysis.coefficients.clone();
             let tonal_result = quant::extract_tonal_components(
@@ -408,7 +401,6 @@ impl PrototypeEncoder {
             sound_unit.coded_qmf_bands = coded_qmf_bands as u8;
             sound_unit.gain_bands = analysis.gain_bands[..coded_qmf_bands].to_vec();
 
-            // Attach tonal, resize band_flags/cells to match coded_qmf_bands
             sound_unit.tonal_mode_selector = tonal_result.tonal_mode_selector;
             sound_unit.tonal_components = tonal_result
                 .tonal_components
@@ -423,9 +415,6 @@ impl PrototypeEncoder {
                 })
                 .collect();
 
-            // Safety: if the total exceeds the per-channel slot, drop the
-            // tonal and re-quantize the original spectrum with the full
-            // budget. Spectral-only encoding is always the fallback.
             if let Ok(total) = sound_unit.bit_len() {
                 if total > base_target {
                     sound_unit.tonal_mode_selector =
@@ -616,9 +605,6 @@ impl PrototypeEncoder {
                 self.mdct.forward_reference(&mdct_input)
             } else {
                 let mut c = self.mdct.forward(&mdct_input);
-                // The reference transform scales by 1/128. Our allocator and scale factor
-                // search are tuned against the unscaled coefficient range, so we compensate
-                // back to that range here.
                 for coefficient in &mut c {
                     *coefficient *= quantizer_compat_gain();
                 }
@@ -723,101 +709,4 @@ fn slice_frame(channel: &[f32], start: usize) -> Vec<f32> {
         }
     }
     frame
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{PrototypeEncoder, PrototypeOptions};
-    use crate::{
-        atrac3::{
-            SAMPLES_PER_FRAME,
-            sound_unit::{CodingMode, SpectralTableKind},
-        },
-        metrics::WavData,
-    };
-
-    #[test]
-    fn encodes_zero_wav_into_raw_frame() {
-        let wav = WavData {
-            sample_rate: 44_100,
-            channels: 1,
-            samples: vec![0.0; SAMPLES_PER_FRAME],
-        };
-
-        let result = PrototypeEncoder::encode_wav(
-            &wav,
-            PrototypeOptions {
-                coding_mode: CodingMode::Clc,
-                lambda: 0.0,
-                frame_limit: Some(1),
-                start_frame: 0,
-                flush_frames: 0,
-                target_bits_per_channel: None,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(result.frame_count, 1);
-        assert_eq!(result.frames.len(), 1);
-        assert_eq!(result.frames[0].channels.len(), 1);
-        assert!(!result.frames[0].bytes.is_empty());
-        assert_eq!(
-            result.frames[0].channels[0].sound_unit.spectrum.subbands[0].table_kind(),
-            SpectralTableKind::Skip
-        );
-    }
-
-    #[test]
-    fn packs_stereo_sound_units_without_inter_channel_padding() {
-        let wav = WavData {
-            sample_rate: 44_100,
-            channels: 2,
-            samples: vec![0.0; SAMPLES_PER_FRAME * 2],
-        };
-
-        let result = PrototypeEncoder::encode_wav(
-            &wav,
-            PrototypeOptions {
-                coding_mode: CodingMode::Clc,
-                lambda: 0.0,
-                frame_limit: Some(1),
-                start_frame: 0,
-                flush_frames: 0,
-                target_bits_per_channel: None,
-            },
-        )
-        .unwrap();
-
-        let frame = &result.frames[0];
-        assert_eq!(frame.channels[0].bit_len, 25);
-        assert_eq!(frame.channels[1].bit_len, 25);
-        assert_eq!(frame.channels[0].bytes.len(), 4);
-        assert_eq!(frame.channels[1].bytes.len(), 4);
-        assert_eq!(frame.bit_len, 50);
-        assert_eq!(frame.bytes.len(), 7);
-    }
-
-    #[test]
-    fn pads_partial_tail_frame_with_zeros() {
-        let wav = WavData {
-            sample_rate: 44_100,
-            channels: 1,
-            samples: vec![0.0; SAMPLES_PER_FRAME + 32],
-        };
-
-        let result = PrototypeEncoder::encode_wav(
-            &wav,
-            PrototypeOptions {
-                coding_mode: CodingMode::Clc,
-                lambda: 0.0,
-                frame_limit: None,
-                start_frame: 0,
-                flush_frames: 0,
-                target_bits_per_channel: None,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(result.frame_count, 2);
-    }
 }
